@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    container_name: scraper
+    restart: always
+    volumes:
+      # Mount your external hard drive to store the database files
+      - /Volumes/T7/graviris/data-ingest/data/db:/app/data/db
+      # Mount logs directory for persistent logs
+      - /Volumes/T7/graviris/data-ingest/data/logs:/app/logs
+    environment:
+      - SCRAPE_INTERVAL=3600  # Scrape interval in seconds (1 hour)
+      - TZ=America/Los_Angeles  # Set your timezone
+
+  sqlite-data-ingest:
+    image: linuxserver/sqlitebrowser:latest
+    container_name: sqlite-data-ingest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - /Volumes/T7/graviris/data-ingest/data/db:/data
+    ports:
+      - "${SQLITEBROWSER_PORT:-3000}:3000"
+    restart: unless-stopped
