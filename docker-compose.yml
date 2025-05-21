@@ -14,7 +14,7 @@ services:
       # Mount logs directory for persistent logs
       - /Volumes/T7/graviris/data-ingest/data/logs:/app/logs
     environment:
-      - SCRAPE_INTERVAL=3600  # Scrape interval in seconds (1 hour)
+      - SCRAPE_INTERVAL=10800  # Scrape interval in seconds (1 hour)
       - TZ=America/Los_Angeles  # Set your timezone
 
   sqlite-data-ingest:

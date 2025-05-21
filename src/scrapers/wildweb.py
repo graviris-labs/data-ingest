@@ -48,14 +48,68 @@ class WildWebScraper:
         self.base_url = "http://www.wildcad.net/WildCADWeb.asp"
         self.db_path = db_path
         self.session = requests.Session()
-        # Set common headers to mimic browser
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml',
             'Accept-Language': 'en-US,en;q=0.9'
         })
         self._ensure_db_exists()
-        
+        self.api_endpoints = {}
+        self._load_saved_api_endpoints()
+
+    def _load_saved_api_endpoints(self):
+        """Load saved API endpoints from database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Create table if not exists
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS api_endpoints (
+                center_code TEXT PRIMARY KEY,
+                endpoint_url TEXT,
+                last_successful TIMESTAMP
+            )
+            ''')
+            
+            # Load existing endpoints
+            cursor.execute("SELECT center_code, endpoint_url FROM api_endpoints")
+            for row in cursor.fetchall():
+                self.api_endpoints[row[0]] = row[1]
+                
+            conn.close()
+            if self.api_endpoints:
+                logger.info(f"Loaded {len(self.api_endpoints)} saved API endpoints")
+        except Exception as e:
+            logger.error(f"Error loading saved API endpoints: {str(e)}")
+
+    def _save_api_endpoint(self, center_code, endpoint_url):
+        """Save a successful API endpoint to database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS api_endpoints (
+                center_code TEXT PRIMARY KEY,
+                endpoint_url TEXT,
+                last_successful TIMESTAMP
+            )
+            ''')
+            
+            cursor.execute('''
+            INSERT OR REPLACE INTO api_endpoints (center_code, endpoint_url, last_successful)
+            VALUES (?, ?, ?)
+            ''', (center_code, endpoint_url, datetime.now().isoformat()))
+            
+            conn.commit()
+            conn.close()
+            
+            # Update in-memory cache
+            self.api_endpoints[center_code] = endpoint_url
+        except Exception as e:
+            logger.error(f"Error saving API endpoint: {str(e)}")
+            
     def _ensure_db_exists(self):
         """Ensure database and tables exist"""
         db_dir = os.path.dirname(self.db_path)
@@ -84,8 +138,12 @@ class WildWebScraper:
             id TEXT PRIMARY KEY,  -- UUID as text (always new for tracking status changes)
             center_id TEXT,       -- UUID reference to dispatch_centers
             incident_id TEXT UNIQUE,     -- Deterministic UUID to identify the same incident
-            incident_number TEXT,
+            incident_number INTEGER,
+            fire_number INTEGER,
+            incident_uuid TEXT,
             fiscal TEXT,
+            wfdssunit TEXT,
+            incident_command TEXT,
             incident_name TEXT,
             incident_type TEXT,
             incident_status TEXT,
@@ -95,6 +153,7 @@ class WildWebScraper:
             longitude REAL,
             resources TEXT,
             acres REAL,
+            fuels TEXT,
             comments REAL,
             raw_data TEXT,
             ingest_date TIMESTAMP,
@@ -265,419 +324,207 @@ class WildWebScraper:
         logger.info(f"Saved {len(centers)} dispatch centers to database")
     
     def get_incidents_for_center(self, center_info):
-        """
-        Get incident data for a specific dispatch center.
-        This function handles MUI DataGrid with virtual scrolling.
-        
-        Args:
-            center_info (dict): Dispatch center information with URL
-            
-        Returns:
-            list: List of incident data for the center
-        """
+        """Get incident data for a specific dispatch center using the API directly."""
         incidents = []
-        processed_rows = set()
-        total_rows = 0
+        processed_count = 0
+        total_count = 0
+        
         try:
             logger.info(f"Fetching incidents for {center_info['center_name']}")
-            
-            # Update the URL to use the incidents page with the dc_Name parameter
             incidents_url = f"https://www.wildwebe.net/incidents?dc_Name={center_info['center_code']}"
-            logger.info(f"Accessing incidents URL: {incidents_url}")
             
-            # Set up headless Chrome browser
+            # First load the page to capture the right API endpoint and any authentication
             chrome_options = Options()
             chrome_options.add_argument("--headless")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
-            # Increase window size for more visible rows
-            chrome_options.add_argument("--window-size=1920,1080")
             
-            # Initialize the browser
+            # Enable network logging
+            chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            
             driver = webdriver.Chrome(options=chrome_options)
+            
             try:
-                # Navigate to the incidents page
                 driver.get(incidents_url)
                 
-                # Wait for the data grid to load
-                WebDriverWait(driver, 30).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "[role='grid']"))
-                )
-                
-                # Give the JavaScript some time to load all the data
+                # Wait for network activity to occur
                 time.sleep(10)
                 
-                grid_element = driver.find_element(By.CSS_SELECTOR, "[role='grid']")
-                try:
-                    aria_rowcount = grid_element.get_attribute('aria-rowcount')
-                    if aria_rowcount and aria_rowcount.isdigit():
-                        total_rows = int(aria_rowcount)
-                        logger.info(f"Found total rows from aria-rowcount: {total_rows - 1}")
-                except Exception as e:
-                    logger.error(f"Error getting aria-rowcount: {str(e)}")
+                # Process performance logs to find the API call and its details
+                api_url = None
+                request_headers = {}
                 
-                # if total_rows == 0 and row_count_elements:
-                #     for elem in row_count_elements:
-                #         try:
-                #             row_count_text = elem.text
-                #             logger.info(f"Found row count element: {row_count_text}")
-                            
-                #             # Try to extract the number (format might be "1-10 of 42" or just "42 rows")
-                #             matches = re.search(r'of\s+(\d+)|(\d+)\s+rows', row_count_text)
-                #             if matches:
-                #                 # Get the matching group that contains the number
-                #                 total_rows = int(matches.group(1) if matches.group(1) else matches.group(2))
-                #                 logger.info(f"Total rows identified: {total_rows}")
-                #                 break
-                #         except Exception as e:
-                #             logger.error(f"Error extracting row count: {str(e)}")
-                
-                ## If we couldn't determine the row count from the UI, try executing JavaScript to get it
-                # if total_rows == 0:
-                #     try:
-                #         # Try to get row count via JavaScript
-                #         js_row_count = driver.execute_script("""
-                #         // Try to get total row count from MUI DataGrid
-                #         const gridElement = document.querySelector('[role="grid"]');
-                #         if (gridElement && gridElement.__data && gridElement.__data.length) {
-                #             return gridElement.__data.length;
-                #         }
-                        
-                #         // Try to find in other places
-                #         for (const key in window) {
-                #             if (key.match(/data|rows|incidents|grid/i)) {
-                #                 const value = window[key];
-                #                 if (Array.isArray(value) && value.length > 0) {
-                #                     // Check if it looks like our data
-                #                     if (value[0] && (value[0].incident_num || value[0].name)) {
-                #                         return value.length;
-                #                     }
-                #                 }
-                #             }
-                #         }
-                        
-                #         // Default
-                #         return 0;
-                #         """)
-                        
-                #         if js_row_count and isinstance(js_row_count, (int, float)) and js_row_count > 0:
-                #             total_rows = int(js_row_count)
-                #             logger.info(f"JavaScript found {total_rows} total rows")
-                #     except Exception as e:
-                #         logger.error(f"Error getting row count via JavaScript: {str(e)}")
-                
-                # Still no row count? Let's set a high default value to ensure we get all data
-                if total_rows == 0:
-                    # Set a high default - typical incidents might be in the hundreds for active centers
-                    total_rows = 250  # This is a very high default to ensure we try to get all rows
-                    logger.info(f"Could not determine row count, using default target of {total_rows} rows")
-                
-                # Find the scrollable container for the virtual scroller
-                scroller = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".MuiDataGrid-virtualScroller"))
-                )
-                
-                # Find the grid
-                grid = driver.find_element(By.CSS_SELECTOR, "[role='grid']")
-                
-                # Get headers first
-                header_row = grid.find_elements(By.CSS_SELECTOR, "[role='columnheader']")
-                
-                # Map headers to positions
-                field_positions = {}
-                for i, header in enumerate(header_row):
-                    header_text = header.text.strip().lower()
-                    if 'inc#' in header_text:
-                        field_positions['incident_number'] = i
-                    elif 'fiscal' in header_text:
-                        field_positions['fiscal'] = i
-                    elif 'name' in header_text:
-                        field_positions['incident_name'] = i
-                    elif 'type' in header_text:
-                        field_positions['incident_type'] = i
-                    elif 'status' in header_text:
-                        field_positions['incident_status'] = i
-                    elif 'local' in header_text or 'date' in header_text:
-                        field_positions['local_date'] = i
-                    elif 'location' in header_text:
-                        field_positions['location'] = i
-                    elif 'lat' in header_text or 'long' in header_text or 'lat/long' in header_text:
-                        field_positions['lat_long'] = i
-                    elif 'resources' in header_text:
-                        field_positions['resources'] = i
-                    elif 'acres' in header_text:
-                        field_positions['acres'] = i
-                    elif 'web' in header_text or 'comment' in header_text:
-                        field_positions['comments'] = i
-                
-                # If we couldn't determine field positions, use a default mapping
-                if not field_positions:
-                    # Create a default mapping based on common column order
-                    field_positions = {
-                        'incident_number': 0,
-                        'fiscal': 1,
-                        'incident_name': 2,
-                        'incident_type': 3,
-                        'incident_status': 4,
-                        'local_date': 5,
-                        'location': 6,
-                        'lat_long': 7,
-                        'resources': 8,
-                        'acres': 9,
-                        'comments': 10
-                    }
-                
-                # Initialize a set to track which rows we've already processed
-                processed_rows = set()
-                
-                # Set target rows to the determined total
-                target_rows = total_rows
-                logger.info(f"Attempting to extract {target_rows - 1} rows through scrolling")
-                
-                # Keep track of the maximum row index we've seen
-                max_row_index_seen = 0
-                
-                # Keep scrolling and processing rows until we have all rows or reached a limit
-                # Use a higher max_scroll_attempts value to ensure we can get to hundreds of rows if needed
-                max_scroll_attempts = 100  # Increased from 50 to 100
-                scroll_attempts = 0
-                stagnant_count = 0  # Counter for when no new rows are found
-                last_row_count = 0
-                seen_incident_ids = set()
-
-                while len(processed_rows) < target_rows and scroll_attempts < max_scroll_attempts:
-                    # Scroll down to load more rows
-                    actions = ActionChains(driver)
-                    actions.move_to_element(scroller)
-                    actions.click()
-                    actions.send_keys(Keys.PAGE_DOWN)
-                    actions.perform()
-
-                    current_row_count = len(processed_rows)
-                    # Wait a moment for new rows to load
-                    time.sleep(0.5)
-                    
-                    # Get all visible rows
-                    visible_rows = grid.find_elements(By.CSS_SELECTOR, "[role='row'][data-rowindex]")
-
-                    # Process any new rows
-                    for row in visible_rows:
-                        try:
-                            # Get row index to uniquely identify it
-                            row_index = row.get_attribute('data-rowindex')
-                            
-                            # Skip header row
-                            if 'headerrow' in (row.get_attribute('class') or ''):
-                                continue
-                            
-                            # Skip already processed rows
-                            if row_index in processed_rows:
-                                continue
-                            
-                            # Add debug logging to track row indices
-                            logger.debug(f"Processing row with index: {row_index}")
-                            
-                            # Mark this row as processed
-                            processed_rows.add(row_index)
-                            
-                            # Update max row index seen
-                            try:
-                                row_index_int = int(row_index)
-                                max_row_index_seen = max(max_row_index_seen, row_index_int)
-                            except ValueError:
-                                pass
-                            
-                            # Get all cells in this row
-                            cells = row.find_elements(By.CSS_SELECTOR, "[role='cell']")
-                            
-                            # Add debug logging for empty rows
-                            if not cells:
-                                logger.debug(f"Row {row_index} has no cells")
-                                continue
-                            
-                            # Extract text from cells based on field positions
-                            cell_values = {}
-                            for field, position in field_positions.items():
-                                if position < len(cells):
-                                    cell_values[field] = cells[position].text.strip()
-                                else:
-                                    cell_values[field] = ""
-                            
-                            # Add more debug logging for cell values
-                            logger.debug(f"Row {row_index} cell values: {cell_values}")
-                            
-                            # Extract key fields
-                            incident_number = cell_values.get('incident_number', '')
-                            incident_name = cell_values.get('incident_name', '')
-                            incident_status = cell_values.get('incident_status', 'none')
-                            lat_long = self._extract_lat_long(cell_values.get('lat_long', ''))
-                            latitude = lat_long[0] if lat_long else None
-                            longitude = lat_long[1] if lat_long else None
-
-                            # Skip empty rows
-                            if not incident_number and not incident_name:
-                                logger.debug(f"Skipping row {row_index} because it has no incident number or name")
-                                continue
-                            
-                            # Generate deterministic UUID to identify the same incident
-                            incident_id = self._generate_deterministic_incident_uuid(
-                                center_info['center_code'], 
-                                incident_number, 
-                                incident_name,
-                                incident_status
-                            )
-                            
-                            if incident_id in seen_incident_ids:
-                                logger.debug(f"Duplicate incident ID found: {incident_id}")
-                                continue
-                            
-                            # Add incident_id to seen_incident_ids
-                            seen_incident_ids.add(incident_id)
-
-                            # Generate a random UUID for this specific occurrence
-                            occurrence_id = str(uuid.uuid4())
-                            
-                            # Create incident data
-                            incident_data = {
-                                'id': occurrence_id,
-                                'incident_id': incident_id,
-                                'center_id': center_info['id'],
-                                'incident_number': incident_number,
-                                'incident_name': incident_name,
-                                'fiscal': cell_values.get('fiscal', ''),
-                                'incident_type': cell_values.get('incident_type', ''),
-                                'incident_status': cell_values.get('incident_status', ''),
-                                'local_date': self._convert_datetime(cell_values.get('local_date', '')),
-                                'location': cell_values.get('location', ''),
-                                'latitude': latitude,
-                                'longitude': longitude,
-                                'resources': cell_values.get('resources', ''),
-                                'acres': self._extract_acres(cell_values.get('acres', '')),
-                                'comments': cell_values.get('comments', ''),
-                                'raw_data': json.dumps({field: value for field, value in cell_values.items()}),
-                                'ingest_date': datetime.now().isoformat()
-                            }
-                            # Add to our list
-                            incidents.append(incident_data)
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing row: {str(e)}")
-                    
-                    # Check if we got new rows in this iteration
-                    if len(processed_rows) > current_row_count:
-                        last_row_count = len(processed_rows)
-                        logger.info(f"Processed {len(processed_rows)} rows so far, highest row index: {max_row_index_seen}")
-                        stagnant_count = 0  # Reset stagnant counter
-                    else:
-                        # If no new rows found in this iteration, count as stagnant
-                        stagnant_count += 1
-                        
-                        # If we're stagnant for too long, try more aggressive scrolling
-                        if stagnant_count >= 3:
-                            # Try JavaScript scrolling to different positions
-                            scroll_percentage = (scroll_attempts % 10) / 10  # Vary between 0 and 0.9
-                            try:
-                                # Try to scroll to different positions in the grid
-                                driver.execute_script(
-                                    f"arguments[0].scrollTop = arguments[0].scrollHeight * {scroll_percentage}", 
-                                    scroller
-                                )
-                                time.sleep(1)  # Give it more time to load
-                            except:
-                                # If JavaScript scrolling fails, try End key or arrow keys
-                                keys_to_try = [Keys.END, Keys.PAGE_DOWN, Keys.ARROW_DOWN * 10]
-                                key_to_send = keys_to_try[scroll_attempts % len(keys_to_try)]
+                logs = driver.get_log('performance')
+                for log in logs:
+                    try:
+                        log_entry = json.loads(log['message'])
+                        if 'message' in log_entry and 'method' in log_entry['message']:
+                            if log_entry['message']['method'] == 'Network.requestWillBeSent':
+                                request = log_entry['message']['params']['request']
+                                request_url = request['url']
                                 
-                                actions = ActionChains(driver)
-                                actions.move_to_element(scroller)
-                                actions.click()
-                                actions.send_keys(key_to_send)
-                                actions.perform()
-                                time.sleep(1)
+                                # Look for API requests to AWS API Gateway
+                                if 'execute-api.us-west-2.amazonaws.com' in request_url and '/centers/' in request_url:
+                                    api_url = request_url
+                                    request_headers = request.get('headers', {})
+                                    logger.info(f"Found API endpoint: {api_url}")
+                                    # Add to the code to save this endpoint for future use
+                                    self.api_endpoints[center_info['center_code']] = api_url
+                                    self._save_api_endpoint(center_info['center_code'], api_url)
+                                    break
+                    except Exception as e:
+                        logger.debug(f"Error processing log entry: {str(e)}")
+                
+                if not api_url:
+                    logger.warning(f"Could not find API endpoint for {center_info['center_name']}")
+                    return [], 0, 0
                     
-                    # Increment scroll attempts counter
-                    scroll_attempts += 1
-                    
-                    # Log progress periodically
-                    if scroll_attempts % 10 == 0:
-                        logger.info(f"Scroll attempt {scroll_attempts}, processed {len(processed_rows)} rows")
-                    
-                    if len(processed_rows) < total_rows - 1:
-                        logger.warning(f"Only processed {len(processed_rows)} of {total_rows} rows")
+                # Now make the API request directly with the same headers the browser used
+                session = requests.Session()
+                
+                # Copy important headers from the browser request
+                important_headers = ['authorization', 'x-api-key', 'x-amz-date', 'x-amz-security-token']
+                headers = {k.lower(): v for k, v in request_headers.items() 
+                        if k.lower() in important_headers or k.lower().startswith('x-')}
+                
+                # Add common headers
+                headers.update({
+                    'User-Agent': driver.execute_script('return navigator.userAgent'),
+                    'Referer': incidents_url,
+                    'Origin': 'https://www.wildwebe.net'
+                })
+                
+                logger.info(f"Making API request to {api_url}")
+                response = session.get(api_url, headers=headers)
+                
+                if response.status_code == 200:
+                    try:
+                        if response is not None:
+                            json_data = response.json()
+                            data = []
+                            for resp in json_data:
+                                if resp.get('data') is not None:
+                                    data.extend(resp['data'])
+                        else:
+                            data = []
+
+                        total_count = len(data)
+                        logger.info(f"API request succeeded, found {total_count} incidents")
                         
-                        # Find missing row indices
-                        expected_indices = set(range(total_rows))
-                        processed_indices = set()
-                        
-                        # Convert string indices to integers
-                        for idx in processed_rows:
+                        # Process the API response data
+                        for item in data:
                             try:
-                                processed_indices.add(int(idx))
-                            except ValueError:
-                                pass
+                                processed_count += 1
+                                
+                                for key, value, in item.items():
+                                    if isinstance(value, str) and value.startswith('*'):
+                                        item[key] = None
+
+                                # Map API fields based on the provided JSON structure
+                                incident_number = item.get('inc_num', 'none')
+                                incident_name = item.get('name', 'none')
+                                incident_status = 'Unknown'  # Default status
+
+                                # Parse fire_status JSON string if present
+                                if item.get('fire_status'):
+                                    try:
+                                        fire_status = json.loads(item.get('fire_status', '{}'))
+                                        # Determine incident status based on dates
+                                        if fire_status.get('out'):
+                                            incident_status = 'Out'
+                                        elif fire_status.get('control'):
+                                            incident_status = 'Controlled'
+                                        elif fire_status.get('contain'):
+                                            incident_status = 'Contained'
+                                        else:
+                                            incident_status = 'Active'
+                                    except:
+                                        # If JSON parsing fails, use a default status
+                                        incident_status = 'Unknown'
+                                
+                                # Skip empty records
+                                if not incident_number and not incident_name:
+                                    continue
+                                    
+                                # Generate deterministic UUID
+                                incident_id = self._generate_deterministic_incident_uuid(
+                                    center_info['center_code'],
+                                    incident_number,
+                                    incident_name,
+                                    incident_status
+                                )
+                                
+                                # Generate a random UUID for this occurrence
+                                occurrence_id = str(uuid.uuid4())
+                                
+                                # Extract coordinates if available
+                                latitude = self._convert_float(item.get('latitude'))
+                                longitude = self._convert_float(item.get('longitude'))
+                                longitude = -longitude if longitude is not None else None
+                                
+                                # Parse resources array to string
+                                resources = []
+                                if item.get('resources'):
+                                    resources = [r for r in item.get('resources', []) if r]
+                                resources_str = ', '.join(resources) if resources else ''
+                                
+                                # Parse fiscal data if available
+                                fiscal_data = {}
+                                if item.get('fiscal_data'):
+                                    try:
+                                        fiscal_data = json.loads(item.get('fiscal_data', '{}'))
+                                    except:
+                                        pass
+                                
+                                fiscal_code = fiscal_data.get('fire_code')
+                                wfdssunit = fiscal_data.get('wfdssunit')
+                                
+                                # Map the rest of the fields
+                                incident_data = {
+                                    'id': occurrence_id,
+                                    'center_id': center_info['id'],
+                                    'incident_id': incident_id,
+                                    'incident_number': self._convert_int(incident_number),
+                                    'fire_number': self._convert_int(item.get('fire_num')),
+                                    'incident_uuid': item.get('uuid'),
+                                    'fiscal': fiscal_code,
+                                    'wfdssunit': wfdssunit,
+                                    'incident_command': item.get('ic'),
+                                    'incident_name': incident_name,
+                                    'incident_type': item.get('type'),
+                                    'incident_status': incident_status,
+                                    'local_date': item.get('date'),
+                                    'location': item.get('location'),
+                                    'latitude': latitude,
+                                    'longitude': longitude,
+                                    'resources': resources_str,
+                                    'acres': self._convert_float(item.get('acres')),
+                                    'fuels': item.get('fuels'),
+                                    'comments': item.get('webComment'),
+                                    'raw_data': json.dumps(item),
+                                    'ingest_date': datetime.now().isoformat()
+                                }
+                                
+                                incidents.append(incident_data)
+                            except Exception as e:
+                                processed_count -= 1
+                                logger.error(f"Error processing incident: {str(e)}")
                         
-                        # Calculate missing indices
-                        missing_indices = expected_indices - processed_indices
-                        logger.warning(f"Missing row indices: {sorted(missing_indices)}")
-
-                    if len(processed_rows) >= target_rows:
-                        logger.warning(f"Scrolling got {len(processed_rows)} rows (100% of target {target_rows}) trying to load more...")
-                        target_rows += 50
-
-                    if (len(processed_rows) > target_rows * 0.9 and stagnant_count >= 15) or (stagnant_count >= 20):
-                        logger.info(f"Either over 90% of target rows processed ({len(processed_rows)}/{target_rows}) and no new rows for 15 attempts, or no new rows for 20 attempts. Assuming all rows loaded.")
-                        break
-
-                    # # Special termination case: if we've seen more than 50% of the target rows, 
-                    # # and we've been stagnant for a while, assume we've loaded all rows
-                    # if (len(processed_rows) > target_rows * 0.5 and stagnant_count >= 10):
-                    #     logger.info(f"Over 50% of target rows processed ({len(processed_rows)}/{target_rows}) and no new rows for 10 attempts. Assuming all rows loaded.")
-                    #     break
-
-                    if (len(processed_rows) == 0 and stagnant_count >= 15):
-                        logger.error(f"No rows for 10 attempts. Check data source: {center_info} and try again.")
-                        for log in driver.get_log('browser'):
-                            logger.error(f"Browser console: {log}")
-                        break
-                
-                logger.info(f"Completed scrolling after {scroll_attempts} attempts, extracted {len(incidents)} incidents")
-                
-            except Exception as e:
-                logger.error(f"Selenium error: {str(e)}")
-                
+                        logger.info(f"Successfully processed {len(incidents)}/{total_count} incidents")
+                        return incidents, processed_count, total_count
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing API response: {str(e)}")
+                else:
+                    logger.error(f"API request failed with status code {response.status_code}: {response.text}")
+            
             finally:
-                # Close the browser
                 driver.quit()
-            
-            # If we got incidents, return them
-            if not incidents:
-                logger.warning(f"No incidents found for {center_info['center_name']}")
-            
-            return incidents, len(processed_rows), target_rows - 1
+                
         except Exception as e:
-            logger.error(f"Error getting incidents for {center_info['center_name']}: {str(e)}")
-            return []
-    
-    def _get_cell_value(self, cells, header_map, field_name):
-        """Get cell value based on header map"""
-        if field_name in header_map and header_map[field_name] < len(cells):
-            return cells[header_map[field_name]].text.strip()
-        return ""
-    
-    def _extract_acres(self, text):
-        """Extract acreage value from text"""
-        if not text:
-            return None
-            
-        # Remove non-numeric characters except decimal points
-        numbers = re.findall(r'[\d,]+\.?\d*', text)
-        if numbers:
-            # Convert to float, handling commas
-            try:
-                return float(numbers[0].replace(',', ''))
-            except ValueError:
-                return None
-        return None
+            logger.error(f"Error in API-based scraping for {center_info['center_name']}: {str(e)}")
+        
+        return [], processed_count, total_count
         
     def _convert_datetime(self, text):
         """Convert datetime string to datetime object"""
@@ -705,21 +552,25 @@ class WildWebScraper:
             
         except Exception:
             return text
-
-    def _extract_lat_long(self, text):
-        """Extract latitude and longitude from text if available"""
+    
+    def _convert_float(self, text):
+        """Convert float string to float"""
         if not text:
             return None
-            
-        # Look for patterns like: 39.5432, -122.3456 or similar
-        coords = re.findall(r'(-?\d+\.\d+)[,\s]+(-?\d+\.\d+)', text)
-        if coords:
-            try:
-                return (float(coords[0][0]), float(coords[0][1]))
-            except (ValueError, IndexError):
-                return None
-                
-        return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+
+    def _convert_int(self, text):
+        """Convert int string to int"""
+        if not text:
+            return None
+        try:
+            return int(text)
+
+        except Exception:
+            return None
     
     def save_incidents(self, incidents):
         """Save incidents to the database"""
@@ -733,15 +584,20 @@ class WildWebScraper:
         for incident in incidents:
             cursor.execute('''
             INSERT INTO incidents 
-            (id, center_id, incident_id, incident_number, fiscal, incident_name, 
-             incident_type, incident_status, local_date, location, 
-             latitude, longitude, resources, acres, comments,
+            (id, center_id, incident_id, incident_number, fire_number, incident_uuid, 
+             fiscal, wfdssunit, incident_command, incident_name, incident_type, 
+             incident_status, local_date, location, 
+             latitude, longitude, resources, acres, fuels, comments,
              raw_data, ingest_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(incident_id) DO UPDATE SET
                 center_id = excluded.center_id,
                 incident_number = excluded.incident_number,
+                fire_number = excluded.fire_number,
+                incident_uuid = excluded.incident_uuid,
                 fiscal = excluded.fiscal,
+                wfdssunit = excluded.wfdssunit,
+                incident_command = excluded.incident_command,
                 incident_name = excluded.incident_name,
                 incident_type = excluded.incident_type,
                 incident_status = excluded.incident_status,
@@ -751,15 +607,20 @@ class WildWebScraper:
                 longitude = excluded.longitude,
                 resources = excluded.resources,
                 acres = excluded.acres,
+                fuels = excluded.fuels,
                 comments = excluded.comments,
                 raw_data = excluded.raw_data,
                 ingest_date = excluded.ingest_date
             ''', (
                 incident['id'],
-                incident['center_id'],           # Random UUID for this occurrence
-                incident['incident_id'],  # Deterministic UUID to identify the same incident
+                incident['center_id'],
+                incident['incident_id'],
                 incident['incident_number'],
+                incident['fire_number'],
+                incident['incident_uuid'],
                 incident['fiscal'],
+                incident['wfdssunit'],
+                incident['incident_command'],
                 incident['incident_name'],
                 incident['incident_type'],
                 incident['incident_status'],
@@ -769,6 +630,7 @@ class WildWebScraper:
                 incident['longitude'],
                 incident['resources'],
                 incident['acres'],
+                incident['fuels'],
                 incident['comments'],
                 incident['raw_data'],
                 incident['ingest_date']
@@ -823,7 +685,7 @@ class WildWebScraper:
         cursor.execute("""
         SELECT * FROM incidents 
         WHERE incident_id = ? 
-        ORDER BY scrape_date
+        ORDER BY ingest_date DESC
         """, (incident_id,))
         
         columns = [desc[0] for desc in cursor.description]
@@ -872,9 +734,9 @@ class WildWebScraper:
             incidents = []
             
             while retry_count < max_retries:
-                incidents, processed_rows, total_rows = self.get_incidents_for_center(center_info)
-                
-                if (incidents and len(incidents) > 0) and (processed_rows == total_rows):
+                incidents, processed_count, total_count = self.get_incidents_for_center(center_info)
+
+                if (incidents and len(incidents) > 0) and (processed_count == total_count):
                     # We got incidents, no need to retry
                     logger.info(f"Successfully fetched {len(incidents)} incidents for {center_info['center_name']}")
                     break
@@ -883,7 +745,7 @@ class WildWebScraper:
                 retry_count += 1
                 if retry_count < max_retries:
                     delay = retry_count * 5  # Increasing delay: 5s, 10s, 15s, 20s
-                    logger.warning(f"Found 0 incidents for {center_info['center_name']} on attempt {retry_count}. Retrying in {delay} seconds...")
+                    logger.warning(f"Processed {processed_count} incidents out of {total_count} for {center_info['center_name']} on attempt {retry_count}. Retrying in {delay} seconds...")
                     time.sleep(delay)
                 else:
                     logger.error(f"Failed to fetch incidents for {center_info['center_name']} after {max_retries} attempts")
